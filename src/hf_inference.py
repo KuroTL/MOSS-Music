@@ -6,6 +6,7 @@ import os
 from typing import Optional
 
 import torch
+from transformers import BitsAndBytesConfig
 
 from src.audio_io import load_audio
 from src.modeling_moss_music import MossMusicModel
@@ -32,15 +33,21 @@ class MossMusicHFInference:
         self,
         model_name_or_path: str = DEFAULT_MODEL_ID,
         device: str = "cuda:0",
-        torch_dtype: str = "auto",
         enable_time_marker: bool = True,
     ):
         self.device = device
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
         self.model = MossMusicModel.from_pretrained(
             model_name_or_path,
             trust_remote_code=True,
-            torch_dtype=torch_dtype,
-            device_map=device,
+            dtype=torch.bfloat16,
+            quantization_config=quantization_config,
+            device_map="auto",
         )
         self.model.eval()
         self.processor = MossMusicProcessor.from_pretrained(

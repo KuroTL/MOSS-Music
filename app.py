@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import subprocess
 import tempfile
@@ -16,13 +18,53 @@ from src.hf_inference import MossMusicHFInference, read_env_model_id, resolve_de
 TITLE = "MOSS-Music Demo"
 
 DEFAULT_QUESTION = "请从风格与速度、调性与和声、乐器编配、结构安排以及整体情绪几个方面描述这段音乐。"
-DEFAULT_MAX_NEW_TOKENS = 1024
+DEFAULT_JSON_PROMPT = (
+    "请按照 music-story/0.2 音乐理解 JSON 规范分析这段音乐，"
+    "只输出合法、完整的 JSON，不要输出 Markdown 或解释文字。"
+)
+DEFAULT_MAX_NEW_TOKENS = 4096
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_TOP_K = 50
+STAGED_JSON_STEPS = (
+    (
+        "profile",
+        """请用简短中文纯文本分析音乐整体画像、人声和主要乐器。
+    不要输出 JSON、Markdown、嵌套列表或重复内容。最多回答 8 行，每行一个事实或判断。
+    覆盖：类型、情绪、速度、调式、人声、主要乐器、编曲特点和一句整体描述。
+    无法确认时明确写“无法确认”，不要猜测，不要写故事。""",
+    ),
+    (
+        "timeline",
+        """请用简短中文纯文本分析歌曲曲式和情绪时间线。
+    不要输出 JSON、Markdown、嵌套列表或重复内容。最多回答 8 行，每行一个段落。
+    每行尽量包含段落名称、起止时间、能量、情绪和听到的变化。
+    无法可靠判断时间时写“时间无法确认”，不要猜测，不要写故事。""",
+    ),
+    (
+        "lyrics",
+        """请用简短中文纯文本分析歌词主题和可用于故事创作的意象。
+    不要输出 JSON、Markdown、嵌套列表或重复内容。最多回答 8 行，每行一个主题或灵感。
+    只输出确认的短歌词片段或摘要；不要完整转载歌词。
+    明确区分听到的内容和可能的故事灵感，不要写完整故事。""",
+    ),
+    (
+        "mapping",
+        """请用简短中文纯文本说明音乐如何映射到故事结构。
+    不要输出 JSON、Markdown、嵌套列表或重复内容。最多回答 8 行。
+    覆盖开场、发展、转折、高潮、结尾分别适合由什么音乐段落承担，以及不确定项。
+    不要写完整故事，不要把推测当成音乐事实。""",
+    ),
+)
+STAGED_TEXT_LIMITS = {
+    "profile": 768,
+    "timeline": 1024,
+    "lyrics": 1024,
+    "mapping": 768,
+}
 VIDEO_EXTENSIONS = {".mp4"}
 DEFAULT_BACKEND = "sglang"
-DEFAULT_SGLANG_BASE_URL = "http://127.0.0.1:30100"
+DEFAULT_SGLANG_BASE_URL = "http://127.0.0.1:30000"
 DEFAULT_SGLANG_API_KEY = ""
 DEFAULT_REQUEST_TIMEOUT = 600
 
@@ -32,7 +74,6 @@ def get_inference(model_name_or_path: str, device: str) -> MossMusicHFInference:
     return MossMusicHFInference(
         model_name_or_path=model_name_or_path,
         device=device,
-        torch_dtype="auto",
         enable_time_marker=True,
     )
 
@@ -170,6 +211,164 @@ def resolve_media_path(audio_path: str | None, video_path: str | None) -> str | 
     return audio_path
 
 
+def generate_answer(
+    media_path: str | None,
+    question: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+) -> tuple[str, str, str, float]:
+    backend = read_backend()
+    started_at = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="moss-music-") as temp_dir:
+        prepared_audio_path = media_path
+        if media_path and Path(media_path).suffix.lower() in VIDEO_EXTENSIONS:
+            prepared_audio_path = os.path.join(temp_dir, "input.mp3")
+            convert_media_to_mp3(media_path, prepared_audio_path)
+
+        if backend == "sglang":
+            answer, model_name_or_path, target = generate_with_sglang(
+                question=question,
+                media_path=prepared_audio_path,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+        else:
+            model_name_or_path = read_env_model_id()
+            device = resolve_device()
+            inference = get_inference(model_name_or_path, device)
+            answer = inference.generate(
+                question=question,
+                audio_path=prepared_audio_path,
+                max_new_tokens=max_new_tokens,
+                do_sample=temperature > 0,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+            target = device
+
+    return answer, model_name_or_path, target, time.perf_counter() - started_at
+
+
+def parse_json_answer(answer: str) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    candidate = answer.strip()
+    if candidate.startswith("```"):
+        lines = candidate.splitlines()
+        candidate = "\n".join(
+            line for line in lines if not line.strip().startswith("```")
+        ).strip()
+    try:
+        return json.loads(candidate, object_pairs_hook=reject_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(
+                    candidate[start : end + 1],
+                    object_pairs_hook=reject_duplicate_keys,
+                )
+            except json.JSONDecodeError:
+                pass
+        raise ValueError(
+            "Model output is not valid complete JSON. The response may be truncated "
+            "or structurally malformed; retry with temperature 0 and preferably "
+            "split the analysis into smaller stages."
+        ) from exc
+
+
+def run_cli(args: argparse.Namespace) -> None:
+    audio_path = Path(args.audio).expanduser().resolve()
+    if not audio_path.is_file():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    output_path = Path(args.output).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.staged_json:
+        run_staged_cli(args, audio_path, output_path)
+        return
+
+    answer, model_name_or_path, target, elapsed_seconds = generate_answer(
+        media_path=str(audio_path),
+        question=args.prompt,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+    )
+    try:
+        result = parse_json_answer(answer)
+    except ValueError as exc:
+        raw_path = output_path.with_suffix(output_path.suffix + ".raw.txt")
+        raw_path.write_text(answer, encoding="utf-8")
+        raise ValueError(
+            f"{exc} Raw model output was saved to: {raw_path} "
+            f"({len(answer)} characters)."
+        ) from exc
+    output_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"JSON written to: {output_path}")
+    print(f"Model: {model_name_or_path}")
+    print(f"Target: {target}")
+    print(f"Elapsed: {elapsed_seconds:.2f}s")
+
+
+def run_staged_cli(
+    args: argparse.Namespace,
+    audio_path: Path,
+    output_path: Path,
+) -> None:
+    started_at = time.perf_counter()
+    result: dict[str, Any] = {
+        "schema_version": "music-story/0.2",
+        "analysis_status": "completed",
+        "source": {"file": audio_path.name, "path": str(audio_path)},
+    }
+    model_name_or_path = read_env_model_id()
+    target = resolve_device()
+    for stage_name, stage_prompt in STAGED_JSON_STEPS:
+        prompt = (
+            f"{stage_prompt}\n\n音频文件名：{audio_path.name}\n"
+            "请只根据音频内容回答。"
+        )
+        answer, _, _, _ = generate_answer(
+            media_path=str(audio_path),
+            question=prompt,
+            max_new_tokens=min(args.max_new_tokens, STAGED_TEXT_LIMITS[stage_name]),
+            temperature=0.0,
+            top_p=0.9,
+            top_k=40,
+        )
+        result[f"{stage_name}_analysis"] = {
+            "format": "plain_text",
+            "content": answer.strip(),
+        }
+        print(f"Completed staged step: {stage_name}")
+
+    output_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"JSON written to: {output_path}")
+    print(f"Model: {model_name_or_path}")
+    print(f"Target: {target}")
+    print(f"Elapsed: {time.perf_counter() - started_at:.2f}s")
+
+
 def run_inference(
     audio_path: str | None,
     video_path: str | None,
@@ -184,44 +383,14 @@ def run_inference(
     backend = read_backend()
 
     try:
-        started_at = time.perf_counter()
-        with tempfile.TemporaryDirectory(prefix="moss-music-") as temp_dir:
-            prepared_audio_path = media_path
-            if media_path and Path(media_path).suffix.lower() in VIDEO_EXTENSIONS:
-                prepared_audio_path = os.path.join(temp_dir, "input.mp3")
-                convert_media_to_mp3(media_path, prepared_audio_path)
-
-            if backend == "sglang":
-                answer, model_name_or_path, target = generate_with_sglang(
-                    question=prompt,
-                    media_path=prepared_audio_path,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                )
-            else:
-                model_name_or_path = read_env_model_id()
-                device = resolve_device()
-                try:
-                    inference = get_inference(model_name_or_path, device)
-                except Exception as exc:  # pragma: no cover
-                    raise gr.Error(
-                        "Failed to load the model. Please check the weights path or "
-                        f"Hugging Face download status.\n{exc}"
-                    ) from exc
-
-                answer = inference.generate(
-                    question=prompt,
-                    audio_path=prepared_audio_path,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=temperature > 0,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                )
-                target = device
-        elapsed_seconds = time.perf_counter() - started_at
+        answer, model_name_or_path, target, elapsed_seconds = generate_answer(
+            media_path=media_path,
+            question=prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
     except Exception as exc:  # pragma: no cover
         raise gr.Error(
             f"{backend} inference failed. Please make sure the uploaded file is readable "
@@ -267,7 +436,7 @@ with gr.Blocks(title=TITLE) as demo:
 
             with gr.Accordion("Advanced Settings", open=False):
                 max_new_tokens_input = gr.Slider(
-                    minimum=64, maximum=2048,
+                    minimum=64, maximum=8192,
                     value=DEFAULT_MAX_NEW_TOKENS, step=32,
                     label="Max New Tokens",
                 )
@@ -326,6 +495,32 @@ with gr.Blocks(title=TITLE) as demo:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run MOSS-Music inference.")
+    parser.add_argument("--audio", help="Input audio or MP4 path for JSON mode.")
+    parser.add_argument("--output", help="Output JSON path for JSON mode.")
+    parser.add_argument(
+        "--staged-json",
+        action="store_true",
+        help="Run four smaller JSON analysis steps and merge their results.",
+    )
+    parser.add_argument(
+        "--prompt", default=DEFAULT_JSON_PROMPT,
+        help="Question or JSON analysis prompt."
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=DEFAULT_TOP_P)
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    args = parser.parse_args()
+    if args.audio:
+        if not args.output:
+            parser.error("--output is required when --audio is provided")
+        try:
+            run_cli(args)
+        except Exception as exc:
+            parser.exit(1, f"Inference failed: {exc}\n")
+        raise SystemExit(0)
+
     server_name = os.environ.get("MOSS_MUSIC_SERVER_NAME", "127.0.0.1")
     server_port = int(os.environ.get("MOSS_MUSIC_SERVER_PORT", "7860"))
     demo.queue(max_size=8).launch(
