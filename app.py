@@ -63,7 +63,7 @@ STAGED_TEXT_LIMITS = {
     "mapping": 768,
 }
 VIDEO_EXTENSIONS = {".mp4"}
-DEFAULT_BACKEND = "sglang"
+DEFAULT_BACKEND = "hf"
 DEFAULT_SGLANG_BASE_URL = "http://127.0.0.1:30000"
 DEFAULT_SGLANG_API_KEY = ""
 DEFAULT_REQUEST_TIMEOUT = 600
@@ -93,7 +93,10 @@ def format_status(
 
 
 def read_backend() -> str:
-    return os.environ.get("MOSS_MUSIC_BACKEND", DEFAULT_BACKEND).strip().lower()
+    backend = os.environ.get("MOSS_MUSIC_BACKEND", DEFAULT_BACKEND).strip().lower()
+    if backend in {"", "auto"}:
+        return "hf"
+    return backend
 
 
 def normalize_sglang_base_url(base_url: str) -> str:
@@ -221,6 +224,26 @@ def generate_answer(
 ) -> tuple[str, str, str, float]:
     backend = read_backend()
     started_at = time.perf_counter()
+    target = ""
+    model_name_or_path = ""
+
+    def run_hf() -> tuple[str, str, str]:
+        nonlocal model_name_or_path, target
+        model_name_or_path = read_env_model_id()
+        device = resolve_device()
+        target = device
+        inference = get_inference(model_name_or_path, device)
+        answer = inference.generate(
+            question=question,
+            audio_path=prepared_audio_path,
+            max_new_tokens=max_new_tokens,
+            do_sample=temperature > 0,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+        return answer, model_name_or_path, target
+
     with tempfile.TemporaryDirectory(prefix="moss-music-") as temp_dir:
         prepared_audio_path = media_path
         if media_path and Path(media_path).suffix.lower() in VIDEO_EXTENSIONS:
@@ -228,28 +251,21 @@ def generate_answer(
             convert_media_to_mp3(media_path, prepared_audio_path)
 
         if backend == "sglang":
-            answer, model_name_or_path, target = generate_with_sglang(
-                question=question,
-                media_path=prepared_audio_path,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            )
+            try:
+                answer, model_name_or_path, target = generate_with_sglang(
+                    question=question,
+                    media_path=prepared_audio_path,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                )
+            except (requests.RequestException, ValueError, OSError):
+                if os.environ.get("MOSS_MUSIC_BACKEND", "").strip().lower() == "sglang":
+                    raise
+                answer, model_name_or_path, target = run_hf()
         else:
-            model_name_or_path = read_env_model_id()
-            device = resolve_device()
-            inference = get_inference(model_name_or_path, device)
-            answer = inference.generate(
-                question=question,
-                audio_path=prepared_audio_path,
-                max_new_tokens=max_new_tokens,
-                do_sample=temperature > 0,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            )
-            target = device
+            answer, model_name_or_path, target = run_hf()
 
     return answer, model_name_or_path, target, time.perf_counter() - started_at
 

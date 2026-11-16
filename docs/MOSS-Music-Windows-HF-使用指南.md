@@ -13,6 +13,8 @@
 
 本文默认使用 HF 模式，不需要启动 SGLang 服务。
 
+> 重要修正：项目在此前的默认配置中将 `MOSS_MUSIC_BACKEND` 固定为 `sglang`，导致界面启动时直接请求 `http://127.0.0.1:30000`，而该服务通常未启动，因此会出现连接失败。当前修正后，默认后端已改为 `hf`，并在未显式指定 `MOSS_MUSIC_BACKEND=sglang` 时自动回退到本地 HF 推理。只有在用户显式要求 SGLang 时，才继续严格使用该后端。
+
 ## 2. 前置条件
 
 建议配置：
@@ -488,7 +490,29 @@ Ctrl+C
 .\.venv\Scripts\python.exe app.py
 ```
 
-### 11.2 `No module named 'transformers'`
+### 11.2 后端默认跳到 `127.0.0.1:30000` 连接失败
+
+这是最常见且最容易误判的问题。根因是之前默认后端被写死为 `sglang`，程序会尝试访问：
+
+```text
+http://127.0.0.1:30000
+```
+
+但当前 Windows 环境下通常没有 SGLang 服务在监听，所以会在启动或推理时抛出连接失败。现在的修正逻辑是：
+
+```powershell
+$env:MOSS_MUSIC_BACKEND = "hf"
+```
+
+如果不配置该环境变量，程序会自动使用 HF。只有在显式设置：
+
+```powershell
+$env:MOSS_MUSIC_BACKEND = "sglang"
+```
+
+时才强制走 SGLang。若确实要使用 SGLang，需确保相关服务已启动，否则仍然会失败。
+
+### 11.3 `No module named 'transformers'`
 
 安装 Transformers：
 
@@ -496,7 +520,7 @@ Ctrl+C
 uv pip install --python .venv\Scripts\python.exe "transformers==4.57.1"
 ```
 
-### 11.3 `huggingface-hub>=0.34.0,<1.0 is required`
+### 11.4 `huggingface-hub>=0.34.0,<1.0 is required`
 
 当前 Hub 版本过高，执行：
 
@@ -504,7 +528,7 @@ uv pip install --python .venv\Scripts\python.exe "transformers==4.57.1"
 uv pip install --python .venv\Scripts\python.exe "huggingface-hub==0.36.0"
 ```
 
-### 11.4 `TorchCodec is required for load_with_torchcodec`
+### 11.5 `TorchCodec is required for load_with_torchcodec`
 
 安装 TorchCodec：
 
@@ -512,7 +536,7 @@ uv pip install --python .venv\Scripts\python.exe "huggingface-hub==0.36.0"
 uv pip install --python .venv\Scripts\python.exe "torchcodec==0.9.*"
 ```
 
-### 11.5 `Could not load libtorchcodec`
+### 11.6 `Could not load libtorchcodec`
 
 依次检查：
 
